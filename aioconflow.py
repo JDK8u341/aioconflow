@@ -462,7 +462,7 @@ class Model(Handle):  # 模型？？？？
         return self
 
     #运行方法
-    async def run(self, data: T) -> V:
+    async def run(self, data: T = None) -> V:
         new_data = None
         for l in self.handles:
             new_data = await l.handle(data) #运行
@@ -590,4 +590,5 @@ def _create_while_loop_layer_decorator(func: Union[Callable[[T,Any],V],Callable[
         def wrapper(*args, **kwargs):
                 #返回这个动态建立的类
                 return LL(*args,**kwargs)
+
         return wrapper
