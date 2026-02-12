@@ -7,6 +7,7 @@ from abc import ABC
 from typing import Union, Iterable, TypeVar, Callable, Any, AsyncIterable
 import asyncio
 import inspect
+import functools
 from multiprocessing import parent_process
 
 
@@ -35,8 +36,10 @@ async def call_func(self,is_async: bool,has_state:bool,func,*args,**kwargs) -> V
         # 如果不是使用线程池运行
         loop_ = asyncio.get_running_loop()
         if has_state:
-            return await loop_.run_in_executor(None, lambda: func(self, *args, **kwargs))
-        return await loop_.run_in_executor(None, lambda: func(*args, **kwargs))
+            func_p = functools.partial(func,self, *args, **kwargs)
+        else:
+            func_p = functools.partial(func, *args, **kwargs)
+        return await loop_.run_in_executor(None, func_p)
 
 class Signal(enum.Enum):
     EXIT = "exit"       #退出
@@ -463,7 +466,7 @@ class Model(Handle):  # 模型？？？？
 
     #运行方法
     async def run(self, data: T = None) -> V:
-        new_data = None
+        new_data = data
         for l in self.handles:
             new_data = await l.handle(data) #运行
             #检查信号
@@ -496,6 +499,15 @@ class Model(Handle):  # 模型？？？？
         return f"Model<name = {self.name}>"
 
 
+class DecoratorLayer(Layer):
+        def __init__(self,func,has_state,*args,**kwargs):  #函数参数
+            self.args = args
+            self.kwargs = kwargs
+            self.has_state = has_state
+            self.func = func
+            self.is_async = inspect.iscoroutinefunction(func)    #是否为异步函数
+        async def handle(self, data):
+            return await call_func(self,self.is_async, self.has_state, self.func,*(data, *self.args), **self.kwargs)
 
 #layer装饰器动态建类
 def layer(func=None, *, has_state=False):
@@ -510,18 +522,30 @@ def layer(func=None, *, has_state=False):
 
     return decorator
 #创建函数
-def _create_layer_decorator(func: Union[Callable[[T,Any],V],Callable[["L",T,Any],V]],has_state=False):
-        is_async = inspect.iscoroutinefunction(func)    #是否为异步函数
-        class L(Layer):
-            def __init__(self,*args,**kwargs):  #函数参数
-                self.args = args
-                self.kwargs = kwargs
-            async def handle(self, data):
-                return await call_func(self,is_async, has_state, func,*(data, *self.args), **self.kwargs)
+def _create_layer_decorator(func: Union[Callable[[T,Any],V],Callable[["DecoratorLayer", T, Any],V]], has_state=False):
+
         def wrapper(*args, **kwargs):
                 #返回这个动态建立的类
-                return L(*args,**kwargs)
+                return DecoratorLayer(func,has_state,*args, **kwargs)
         return wrapper
+
+class DecoratorChoiceLayer(ChoiceLayer):
+        def __init__(self,func,has_state,*args,**kwargs):  #函数参数
+            super().__init__()
+            self.args = args
+            self.kwargs = kwargs
+            self.has_state = has_state
+            self.func = func
+            self.is_async = inspect.iscoroutinefunction(func)
+        async def choice(self, data: T):
+            return await call_func(self,self.is_async,self.has_state,self.func,*(data,self.choices, *self.args),**self.kwargs)
+        #设置分支模型
+        def set_choices(self,*choices: Model):
+            self.choices = {model.get_name():model for model in choices}
+            return self
+
+        def __call__(self, *choices: Model):
+            return self.set_choices(*choices)
 
 #choice装饰器动态建类
 def choice(func=None, *, has_state=False):
@@ -534,27 +558,10 @@ def choice(func=None, *, has_state=False):
 
     return decorator
 
-def _create_choice_decorator(func: Union[Callable[[T,dict[str,Model],Any],V],Callable[["CL",T,dict[str,Model],Any],V]],has_state=False):
-        is_async = inspect.iscoroutinefunction(func)    #是否为异步函数
-        class CL(ChoiceLayer):
-            def __init__(self,*args,**kwargs):  #函数参数
-                super().__init__()
-                self.args = args
-                self.kwargs = kwargs
-            async def choice(self, data: T):
-                return await call_func(self,is_async,has_state,func,*(data,self.choices, *self.args),**self.kwargs)
-            #设置分支模型
-            def set_choices(self,*choices: Model):
-                self.choices = {model.get_name():model for model in choices}
-                return self
-
-            def __call__(self, *choices: Model):
-                self.choices = {model.get_name():model for model in choices}
-                return self
-
+def _create_choice_decorator(func: Union[Callable[[T,dict[str,Model],Any],V],Callable[["DecoratorChoiceLayer", T, dict[str,Model], Any],V]], has_state=False):
         def wrapper(*args, **kwargs):
             #返回这个动态建立的类
-            return CL(*args,**kwargs)
+            return DecoratorChoiceLayer(func,has_state,*args, **kwargs)
         return wrapper
 
 #while_loop_layer装饰器动态建类
@@ -568,27 +575,29 @@ def while_loop_layer(func=None, *, has_state=False):
 
     return decorator
 
+
+class DecoratorWhileLoopLayer(WhileLoopLayer):
+    def __init__(self,func,has_state, *args, **kwargs):  # 函数参数
+        super().__init__(None)
+        self.args = args
+        self.kwargs = kwargs
+        self.func = func
+        self.is_async = inspect.iscoroutinefunction(func)
+        self.has_state = has_state
+
+    async def do_while(self, data):
+        return await call_func(self, self.is_async, self.has_state, self.func, *(data, *self.args), **self.kwargs)
+
+    def set_loop_model(self, loops: "Model") -> WhileLoopLayer:
+        self.loops = loops
+        return self
+
+    def __call__(self, loops: "Model") -> WhileLoopLayer:
+        return self.set_loop_model(loops)
+
 #创建函数
-def _create_while_loop_layer_decorator(func: Union[Callable[[T,Any],V],Callable[["L",T,Any],V]],has_state=False):
-        is_async = inspect.iscoroutinefunction(func)    #是否为异步函数
-        class LL(WhileLoopLayer):
-            def __init__(self, *args, **kwargs):  #函数参数
-                super().__init__(None)
-                self.args = args
-                self.kwargs = kwargs
-
-            async def do_while(self, data):
-                return await call_func(self,is_async,has_state,func,*(data,*self.args),**self.kwargs)
-
-            def set_loop_model(self,loops:"Model") -> WhileLoopLayer:
-                self.loops = loops
-                return self
-
-            def __call__(self,loops: "Model") -> WhileLoopLayer:
-                return self.set_loop_model(loops)
-
+def _create_while_loop_layer_decorator(func: Union[Callable[[T,Any],V],Callable[["DecoratorLayer", T, Any],V]], has_state=False):
         def wrapper(*args, **kwargs):
                 #返回这个动态建立的类
-                return LL(*args,**kwargs)
-
+                return DecoratorWhileLoopLayer(func,has_state,*args, **kwargs)
         return wrapper
