@@ -361,14 +361,14 @@ class ReDoLoopLayer(LoopLayer):
     def __init__(self, loops: Union["Model",Layer],loop_num):
         super().__init__(loops)
         self.do_num = loop_num
-        self.cnt = 0
 
     async def handle(self, data: T) -> V:
-        while self.cnt < self.do_num:
+        cnt = 0
+        while cnt < self.do_num:
             data, is_ret = await self.handle_call(data)
             if is_ret:
                 return data
-            self.cnt += 1
+            cnt += 1
         return data
 
 #工具Layer：简单While循环
