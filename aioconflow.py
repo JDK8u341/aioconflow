@@ -277,7 +277,7 @@ class RetryLayer(Layer):
                         return await self.fatal_handle.handle(DataWithSignal((first_data,e),Signal.ERROR))
                     else:
                         return DataWithSignal((first_data,e),Signal.ERROR)
-            await asyncio.sleep(delay_time(retry_num))
+            await asyncio.sleep(delay_time(self.retry_num-retry_num))
         return data
 
 
