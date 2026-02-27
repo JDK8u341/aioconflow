@@ -113,7 +113,8 @@ class Handle(ABC):
         res = await self.handle(data,clean_context_bag) #使用干净副本处理
         # 如果是单层调用则手动更新
         if isinstance(self,Layer):
-            await clean_context_bag.update_contexts(self,data)
+            await clean_context_bag.update_contexts(self,data,isinstance(self,ConcurrencyLayer))
+
         return res,clean_context_bag    #返回结果和上下文包
 
 
@@ -126,6 +127,52 @@ class Layer(Handle,ABC):   #抽象基类Layer
     @abc.abstractmethod
     async def handle(self, data: "T",context_bag:"ContextBag") -> "V":   #每个层自己的处理方法
         raise NotImplementedError
+
+
+#上下文对象
+class Context(ABC):
+    #上下文类型名称
+    CONTEXT_TYPE_NAME = "BaseContext"
+
+    #创建实例方法
+    @abc.abstractmethod
+    def __init__(self):
+        raise NotImplementedError
+
+    #初始化钩子
+    @abc.abstractmethod
+    async def init_context(self,context_bag:"ContextBag") -> "Context":
+        raise NotImplementedError
+
+    #每层更新钩子
+    @abc.abstractmethod
+    async def update(self,context_bag:"ContextBag",now_layer: Layer,data: "T"):
+        raise NotImplementedError
+
+    # 并发合并方法，用于与另一个同类型上下文并发合并
+    @abc.abstractmethod
+    async def concurrency_merge(self,context: "Context"):
+        raise NotImplementedError
+
+    #并发层更新钩子
+    @abc.abstractmethod
+    async def concurrency_update(self,context_bag:"ContextBag",now_layer: Layer,data: "T"):
+        raise NotImplementedError
+
+    #合并方法，用于与另一个同类型上下文直接合并
+    @abc.abstractmethod
+    async def direct_merge(self,context:"Context") -> "T":
+        raise NotImplementedError
+
+    #复制方法，用于获取干净副本
+    @abc.abstractmethod
+    def copy(self):
+        raise NotImplementedError
+
+    #设置每个子类的CONTEXT_TYPE_NAME
+    def __init_subclass__(cls, **kwargs):
+        if cls.CONTEXT_TYPE_NAME == "BaseContext":
+            cls.CONTEXT_TYPE_NAME = cls.__name__
 
 #上下文包
 class ContextBag:
@@ -154,10 +201,14 @@ class ContextBag:
             self.contexts[context_obj.CONTEXT_TYPE_NAME] = context_obj     #否则添加
 
     #更新上下文
-    async def update_contexts(self,now_layer: "Layer",data: T):
+    async def update_contexts(self,now_layer: "Layer",data: T,is_concurrency: bool):
         #遍历更新
-        for con in self.contexts.values():
-            await con.update(self,now_layer,data)
+        if not is_concurrency:
+            for con in self.contexts.values():
+                await con.update(self,now_layer,data)
+        else:
+            for con in self.contexts.values():
+                await con.concurrency_update(self,now_layer,data)
 
     # 获取干净副本
     async def get_clear_context_bag(self) -> "ContextBag":
@@ -173,46 +224,13 @@ class ContextBag:
     def get_context(self,context_name):
         return self.contexts[context_name]
 
+    #移除上下文
+    def pop_context(self,context_name:str) -> Context | None:
+        if context_name in self.contexts.keys():
+            return self.contexts.pop(context_name)
+        else:
+            return None
 
-#上下文对象
-class Context(ABC):
-    #上下文类型名称
-    CONTEXT_TYPE_NAME = "BaseContext"
-
-    #创建实例方法
-    @abc.abstractmethod
-    def __init__(self):
-        raise NotImplementedError
-
-    #初始化钩子
-    @abc.abstractmethod
-    async def init_context(self,context_bag:"ContextBag") -> "Context":
-        raise NotImplementedError
-
-    #每层更新钩子
-    @abc.abstractmethod
-    async def update(self,context_bag:"ContextBag",now_layer: Layer,data: "T"):
-        raise NotImplementedError
-
-    # 合并方法，用于与另一个同类型上下文并发合并
-    @abc.abstractmethod
-    async def concurrency_merge(self,context: "Context"):
-        raise NotImplementedError
-
-    #合并方法，用于与另一个同类型上下文直接合并
-    @abc.abstractmethod
-    async def direct_merge(self,context:"Context") -> "T":
-        raise NotImplementedError
-
-    #复制方法，用于获取干净副本
-    @abc.abstractmethod
-    def copy(self):
-        raise NotImplementedError
-
-    #设置每个子类的CONTEXT_TYPE_NAME
-    def __init_subclass__(cls, **kwargs):
-        if cls.CONTEXT_TYPE_NAME == "BaseContext":
-            cls.CONTEXT_TYPE_NAME = cls.__name__
 
 #工具上下文：LayerCnt，层计数
 class LayerCnt(Context):
@@ -228,9 +246,14 @@ class LayerCnt(Context):
     async def update(self,context_bag:"ContextBag",now_layer: Layer,data: "T"):
         last_cnt = self.cnt #记录上一次计数
         self.cnt += 1   #增加1层经过计数
-        self.cnt += self.merge_cnt  #合并merge_cnt
         print(f"UPDATE CNT {last_cnt} -> {self.cnt} on {now_layer}")
-        self.merge_cnt = 0  #清空merge_cnt
+
+    async def concurrency_update(self,context_bag:"ContextBag",now_layer: Layer,data: "T"):
+        last_cnt = self.cnt  # 记录上一次计数
+        self.cnt += self.merge_cnt #合并计数
+        self.merge_cnt = 0 #清空合并计数
+        print(f"CONCURRENCY UPDATE CNT {last_cnt} -> {self.cnt} on {now_layer}")
+
 
     async def concurrency_merge(self,context:"LayerCnt"):
         print(f"CONCURRENCY MERGE CNT {self.merge_cnt} -> {self.merge_cnt + context.get_cnt() - self.cnt} (M: {context.get_cnt()},S: {self.cnt})")
@@ -281,13 +304,13 @@ class ConcurrencyLayer(Layer,ABC):
 # 在并发中：
 # - 任何一个任务退出，整个退出
 # - 没有一个任务退出，但有一个任务跳出循环，整个跳出循环
-#注：循环Layer的要求，所以BREAK_LOOP至少需要跳出一层模型，
+# 注：循环Layer的要求，所以BREAK_LOOP至少需要跳出一层模型，
 #   且即使使用Layer作为循环，但是循环本身也是一个分支，所以
 #   包含BREAK_MODEL，且因为会跳出循环，所以高于CONTINUE
 # - 没有一个任务跳出循环,但有一个任务跳过循环，整跳过循环
-#注：跳过循环需要一直跳出到循环的那一层模型，可能跳过多层模型，
+# 注：跳过循环需要一直跳出到循环的那一层模型，可能跳过多层模型，
 #   所以包含BREAK_MODEL,且如果只有循环所包裹的一层模型，
-#   也应该使用BREAK_LOOP来跳出循环，且对于Loop处理BREAK_LOOP和BREAK_MODE的方式相同
+#   也应该使用BREAK_LOOP来跳出循环，且对于Loop处理BREAK_LOOP和BREAK_MODEL的方式相同
 # - 没有一个任务跳过循环，但有一个任务跳出模型，整个跳出模型
 # - 否则正常继续
 # - 对于NONE信号则不加入结果列表
@@ -662,7 +685,7 @@ class Model(Handle):  # 模型？？？？
             else await ContextBag.create(*(context_cls() for context_cls in self.context_clss)) #初始化上下文包
         for l in self.handles:
             new_data = await l.handle(data,context_bag) #运行
-            await context_bag.update_contexts(l,new_data)   #更新上下文
+            await context_bag.update_contexts(l,new_data,isinstance(l,ConcurrencyLayer))   #更新上下文
             #检查信号
             if isinstance(new_data, DataWithSignal):
                 #对于EXIT，BREAK_LOOP,CONTINUE_LOOP信号返回DataWithSignal
@@ -686,6 +709,10 @@ class Model(Handle):  # 模型？？？？
         self.name = name
         return self
 
+    #设置使用的上下文
+    def set_contexts(self,*context_clss):
+        self.context_clss = context_clss
+
     async def handle(self, data: T,context_bag:ContextBag | None = None) -> V:
         return await self.run(data,context_bag=context_bag)
 
@@ -702,6 +729,9 @@ class DecoratorLayer(Layer):
             self.is_async = inspect.iscoroutinefunction(func)    #是否为异步函数
         async def handle(self, data,context_bag:"ContextBag"):
             return await call_func(self,self.is_async, self.has_state, self.func,*(data,context_bag, *self.args), **self.kwargs)
+
+        def __str__(self) -> str:
+            return f"DecoratorLayer<Func = {self.func.__name__}>"
 
 #layer装饰器动态建类
 def layer(func=None, *, has_state=False):
@@ -740,6 +770,9 @@ class DecoratorChoiceLayer(ChoiceLayer):
 
         def __call__(self, *choices: Model):
             return self.set_choices(*choices)
+
+        def __str__(self) -> str:
+            return f"DecoratorChoiceLayer<Func = {self.func.__name__}>"
 
 #choice装饰器动态建类
 def choice(func=None, *, has_state=False):
@@ -788,6 +821,9 @@ class DecoratorWhileLoopLayer(WhileLoopLayer):
 
     def __call__(self, loops: "Model") -> WhileLoopLayer:
         return self.set_loop_model(loops)
+
+    def __str__(self) -> str:
+        return f"DecoratorWhileLoopLayer<Func = {self.func.__name__}>"
 
 #创建函数
 def _create_while_loop_layer_decorator(func: Union[Callable[[T,ContextBag,Any],V],Callable[["DecoratorLayer", T,ContextBag, Any],V]], has_state=False):
