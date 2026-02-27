@@ -9,15 +9,16 @@ import asyncio
 import inspect
 import functools
 import itertools
-from multiprocessing import parent_process
+from multiprocessing import Value,Lock
 
 
-MAX_PROCESS_COUNT = os.cpu_count()  #最大进程使用量
-USE_PROCESS = 0     #已使用进程数量
-USE_P_LOCK = asyncio.Lock() #已使用进程数量控制锁
+MAX_PROCESS_COUNT = Value('i',os.cpu_count())  #最大进程使用量
+USE_PROCESS = Value('i',0,lock=False)     #已使用进程数量
+USE_P_LOCK = Lock()
 BASE_WAIT_TIME = 0.1   #基础等待时长
-MAX_WAIT_TIME = 0.5   #最大等待时长
+MAX_WAIT_TIME = 0.3   #最大等待时长
 MAX_CALC_RETRY_COUNT = 10 #最大计算时重试次数,防止计算时指数爆炸，浪费CPU资源
+PROCESS_RESOURCE_ALLOC_RATIO = 0.2 # 进程资源分配比例
 
 #指数退避计算
 delay_time = lambda retry_count: min(BASE_WAIT_TIME * (2 ** min(retry_count,MAX_CALC_RETRY_COUNT)), MAX_WAIT_TIME) + random.random()
@@ -85,19 +86,18 @@ class DataWithSignal:
         else:
             return self
 
-
-
-
-
-async def has_remaining_process(use_process_num: int,is_user_set=False) -> int:
+# 获取剩余资源
+async def get_remaining_process(use_process_num: int,is_user_set=False) -> int:
     global USE_PROCESS
-    async with USE_P_LOCK:
-            if MAX_PROCESS_COUNT - USE_PROCESS >= use_process_num:  #如果能够满足资源直接分配
-                USE_PROCESS += use_process_num
+    with USE_P_LOCK:
+            if MAX_PROCESS_COUNT.value - USE_PROCESS.value >= use_process_num:  #如果能够满足资源直接分配
+                USE_PROCESS.value += use_process_num
                 return use_process_num
-            elif MAX_PROCESS_COUNT - USE_PROCESS > 0 and not is_user_set:   #如果不能满足资源但是还有资源分配剩下的所有资源
-                    USE_PROCESS += MAX_PROCESS_COUNT - USE_PROCESS
-                    return MAX_PROCESS_COUNT - USE_PROCESS
+            elif MAX_PROCESS_COUNT.value - USE_PROCESS.value >= 1 and not is_user_set:   #如果不能满足资源但是还有资源分配剩下的所有资源的一半
+                    resource = int((MAX_PROCESS_COUNT.value - USE_PROCESS.value) * PROCESS_RESOURCE_ALLOC_RATIO)
+                    resource = resource if resource >= 1 else 1
+                    USE_PROCESS.value += resource
+                    return resource
             else:   #否则不分配
                 return 0
 
@@ -283,84 +283,83 @@ class ConcurrencyLayer(Layer,ABC):
 
     #静态方法: 收集并合并数据
     @staticmethod
-    async def merge_and_collect_data(result,context_bag:"ContextBag"):
+    async def merge_and_collect_data(results,context_bag:"ContextBag"):
         res_datas = []  #数据列表
-        for i in result:    #遍历结果
-            #如果出现异常直接抛出
-            if isinstance(i,Exception):
-                raise i
-            #否则处理数据和上下文
+        is_exit = False  # 包含退出信号
+        is_break_model = False  # 包含跳出模型信号
+        is_break_loop = False  # 包含跳出循环信号
+        is_continue_loop = False  # 包含跳过循环信号
+        for i in results:    #遍历结果
+            # 如果出现异常则包装为ERROR信号
+            if isinstance(i, Exception):
+                result = DataWithSignal(i, Signal.ERROR)
             else:
+                #处理数据和上下文
                 #解包数据
-                res_data, _context_bag = i
-                #添加到数据列表
-                res_datas.append(res_data)
+                result, _context_bag = i
                 #合并上下文
-                await context_bag.merge(_context_bag,concurrency_merge=True)
-        return res_datas
+                await context_bag.merge(_context_bag, concurrency_merge=True)
+            #添加到数据列表
+            res_datas.append(result)
 
 
-# 重新包装包含特殊控制流信号的列表
-# 在并发中：
-# - 任何一个任务退出，整个退出
-# - 没有一个任务退出，但有一个任务跳出循环，整个跳出循环
-# 注：循环Layer的要求，所以BREAK_LOOP至少需要跳出一层模型，
-#   且即使使用Layer作为循环，但是循环本身也是一个分支，所以
-#   包含BREAK_MODEL，且因为会跳出循环，所以高于CONTINUE
-# - 没有一个任务跳出循环,但有一个任务跳过循环，整跳过循环
-# 注：跳过循环需要一直跳出到循环的那一层模型，可能跳过多层模型，
-#   所以包含BREAK_MODEL,且如果只有循环所包裹的一层模型，
-#   也应该使用BREAK_LOOP来跳出循环，且对于Loop处理BREAK_LOOP和BREAK_MODEL的方式相同
-# - 没有一个任务跳过循环，但有一个任务跳出模型，整个跳出模型
-# - 否则正常继续
-# - 对于NONE信号则不加入结果列表
-def remake_concurrency_signal(results):
-    is_exit = False             #包含退出信号
-    is_break_model = False      #包含跳出模型信号
-    is_break_loop = False       #包含跳出循环信号
-    is_continue_loop = False    #包含跳过循环信号
-    _results = []   #新返回列表
-    for result in results:  #遍历检查
-        if isinstance(result, DataWithSignal):
-            signal = result.get_signal()
-            if signal == Signal.EXIT:
-                is_exit = True
-                _results.append(result.get_data())  #加入数据
-                continue
-            elif signal == Signal.BREAK_MODEL:
-                is_break_model = True
-                _results.append(result.get_data())
-                continue
-            elif signal == Signal.BREAK_LOOP:
-                is_break_loop = True
-                _results.append(result.get_data())
-                continue
-            elif signal == Signal.CONTINUE_LOOP:
-                is_continue_loop = True
-                _results.append(result.get_data())
-                continue
-            elif signal == Signal.NONE:
-                continue
-        _results.append(result)
+            # 重新包装包含特殊控制流信号的列表
+            # 在并发中：
+            # - 任何一个任务退出，整个退出
+            # - 没有一个任务退出，但有一个任务跳出循环，整个跳出循环
+            # 注：循环Layer的要求，所以BREAK_LOOP至少需要跳出一层模型，
+            #   且即使使用Layer作为循环，但是循环本身也是一个分支，所以
+            #   包含BREAK_MODEL，且因为会跳出循环，所以高于CONTINUE
+            # - 没有一个任务跳出循环,但有一个任务跳过循环，整跳过循环
+            # 注：跳过循环需要一直跳出到循环的那一层模型，可能跳过多层模型，
+            #   所以包含BREAK_MODEL,且如果只有循环所包裹的一层模型，
+            #   也应该使用BREAK_LOOP来跳出循环，且对于Loop处理BREAK_LOOP和BREAK_MODEL的方式相同
+            # - 没有一个任务跳过循环，但有一个任务跳出模型，整个跳出模型
+            # - 否则正常继续
+            # - 对于NONE信号则不加入结果列表
+            if isinstance(result, DataWithSignal):
+                signal = result.get_signal()
+                if signal == Signal.EXIT:
+                    is_exit = True
+                    res_datas.append(result.get_data())  # 加入数据
+                    continue
+                elif signal == Signal.BREAK_MODEL:
+                    is_break_model = True
+                    res_datas.append(result.get_data())
+                    continue
+                elif signal == Signal.BREAK_LOOP:
+                    is_break_loop = True
+                    res_datas.append(result.get_data())
+                    continue
+                elif signal == Signal.CONTINUE_LOOP:
+                    is_continue_loop = True
+                    res_datas.append(result.get_data())
+                    continue
+                elif signal == Signal.NONE:
+                    continue
+            res_datas.append(result)
 
-    #返回包装
-    if is_exit:
-        return DataWithSignal(_results, Signal.EXIT)
-    elif is_break_loop:
-        return DataWithSignal(_results, Signal.BREAK_LOOP)
-    elif is_continue_loop:
-        return DataWithSignal(_results, Signal.CONTINUE_LOOP)
-    elif is_break_model:
-        return DataWithSignal(_results, Signal.BREAK_MODEL)
-    else:
-        return _results
+        # 返回包装
+        if is_exit:
+            return DataWithSignal(res_datas, Signal.EXIT)
+        elif is_break_loop:
+            return DataWithSignal(res_datas, Signal.BREAK_LOOP)
+        elif is_continue_loop:
+            return DataWithSignal(res_datas, Signal.CONTINUE_LOOP)
+        elif is_break_model:
+            return DataWithSignal(res_datas, Signal.BREAK_MODEL)
+        else:
+            return res_datas
+
+
+
 
 #工具Layer：并发
 class ApplyConcurrencyLayer(ConcurrencyLayer):
-    def __init__(self, layer_or_model_s: Union[tuple[Layer, ...], tuple["Model", ...]], is_cpu_dense,use_process):
+    def __init__(self, layer_or_model_s: Union[tuple[Layer, ...], tuple["Model", ...]], is_cpu_dense,use_process_num):
         self.layer_or_model_s: Union[tuple[Layer, ...], tuple["Model", ...]] = layer_or_model_s   #层和模型的列表
         self.is_cpu_dense: bool = is_cpu_dense  #是否CPU密集
-        self.use_process = use_process
+        self.use_process_num = use_process_num
 
     async def handle(self, data: "T",context_bag:"ContextBag") -> "V":
         global USE_PROCESS
@@ -369,11 +368,11 @@ class ApplyConcurrencyLayer(ConcurrencyLayer):
             return []
 
         tasks = []  #任务列表
-        if self.is_cpu_dense and parent_process() is None:   #如果是CPU密集型且不是sub的
-            use = self.use_process if self.use_process is not None else len(self.layer_or_model_s)  # 需要使用的进程数量
+        if self.is_cpu_dense:   #如果是CPU密集型且不是sub的
+            use = self.use_process_num if self.use_process_num is not None else len(self.layer_or_model_s)  # 需要使用的进程数量
             retry_count = 0
             while True:
-                num = await has_remaining_process(use, is_user_set=self.use_process is not None)
+                num = await get_remaining_process(use, is_user_set=self.use_process_num is not None)
                 if num > 0:
                     # 创建进程池，数量为任务数与最大进程数取小的那一个
                     async with Pool(processes=num) as p:
@@ -385,8 +384,8 @@ class ApplyConcurrencyLayer(ConcurrencyLayer):
                         try:
                             result = await asyncio.gather(*tasks,return_exceptions=True)
                         finally:
-                            async with USE_P_LOCK:
-                                USE_PROCESS -= num  #恢复使用进程数量
+                            with USE_P_LOCK:
+                                USE_PROCESS.value -= num  #恢复使用进程数量
                     break
                 else:
                     retry_count += 1
@@ -396,15 +395,15 @@ class ApplyConcurrencyLayer(ConcurrencyLayer):
 
         #合并上下文并收集结果
         res_datas = await self.merge_and_collect_data(result, context_bag)
-        return remake_concurrency_signal(res_datas)
+        return res_datas
 
 
 #工具Layer：映射并发
 class MapConcurrencyLayer(ConcurrencyLayer):
-    def __init__(self, layer_or_model: Union[Layer,"Model"],is_cpu_dense,use_process):
+    def __init__(self, layer_or_model: Union[Layer,"Model"],is_cpu_dense,use_process_num):
         self.layer_or_model = layer_or_model    #层或模型
         self.is_cpu_dense: bool = is_cpu_dense  #是否CPU密集
-        self.use_process = use_process
+        self.use_process_num = use_process_num
 
     async def handle(self, data: T,context_bag:"ContextBag") -> V:
         global USE_PROCESS
@@ -418,19 +417,19 @@ class MapConcurrencyLayer(ConcurrencyLayer):
         if len(data) == 0:  #如果是空的则直接返回
             return []
 
-        if self.is_cpu_dense and parent_process() is None:
-            use = self.use_process if self.use_process is not None else len(data)   #需要的进程数
+        if self.is_cpu_dense:
+            use = self.use_process_num if self.use_process_num is not None else len(data)   #需要的进程数
             retry_count = 0 #尝试次数
             while True:
-                num = await has_remaining_process(use, is_user_set=self.use_process is not None)
+                num = await get_remaining_process(use, is_user_set=self.use_process_num is not None)
                 if num > 0:
                     try:
                         async with Pool(processes=num) as p:
                             results = await p.starmap(self.layer_or_model.concurrency_handle, iter(zip(data,itertools.repeat(context_bag, len(data))))) #批量提交
 
                     finally:
-                        async with USE_P_LOCK:
-                            USE_PROCESS -= num
+                        with USE_P_LOCK:
+                            USE_PROCESS.value -= num
                     break
                 else:
                     retry_count += 1
@@ -441,7 +440,7 @@ class MapConcurrencyLayer(ConcurrencyLayer):
 
         res_datas = await self.merge_and_collect_data(results,context_bag)
 
-        return remake_concurrency_signal(res_datas)
+        return res_datas
 
 
 
@@ -454,20 +453,30 @@ class RetryLayer(Layer):
         self.fatal_handle = fatal_handle    #如果尝试都失败以后的分支
 
     async def handle(self, data,context_bag:"ContextBag"):
-        first_data = data
+        # 传入的值
+        in_data = data
+        # 重试次数
         retry_num = self.retry_num
+
+        #重试
         while True:
             try:
-                data = await self.try_handle.handle(first_data,context_bag)
+                # 尝试执行逻辑
+                data = await self.try_handle.handle(in_data, context_bag)
+                # 清空重试次数
                 retry_num = 0
+                # 跳出
                 break
             except self.catch_err_type as e:
+                # 如果出现异常
+                # 减少重试机会
                 retry_num -= 1
+                # 如果机会用光则返回
                 if retry_num <= 0:
                     if self.fatal_handle is not None:
-                        return await self.fatal_handle.handle(DataWithSignal((first_data,e),Signal.ERROR),context_bag)
+                        return await self.fatal_handle.handle(DataWithSignal((in_data, e), Signal.ERROR), context_bag)
                     else:
-                        return DataWithSignal((first_data,e),Signal.ERROR)
+                        return DataWithSignal((in_data, e), Signal.ERROR)
             await asyncio.sleep(delay_time(self.retry_num-retry_num))
         return data
 
@@ -538,9 +547,6 @@ class IterLoopLayer(LoopLayer):
     def __init__(self,_iter: Iterable | AsyncIterable,loops: Union["Model",Layer]):
         super().__init__(loops)
         self._iter = _iter
-
-    def do_while(self, data: T) -> bool:
-        pass
 
     async def handle(self, data: T,context_bag:"ContextBag") -> V:
         if isinstance(self._iter,AsyncIterable):
@@ -641,14 +647,15 @@ class Model(Handle):  # 模型？？？？
     #添加一个Apply并发
     def apply_concurrency(self, *layer_or_model_s: Union[Layer, "Model"], cpu_dense=False, use_process=None) -> "Model":
         if cpu_dense and use_process is not None and use_process < 1:
-            raise ValueError("use_process must be >= 1")
-        self.handles.append(ApplyConcurrencyLayer(layer_or_model_s, is_cpu_dense=cpu_dense, use_process=use_process))
+            raise ValueError("use_process_num must be >= 1")
+        self.handles.append(
+            ApplyConcurrencyLayer(layer_or_model_s, is_cpu_dense=cpu_dense, use_process_num=use_process))
         return self
 
     #添加一个Map并发
     def map_concurrency(self, layer_or_model: Union[Layer, "Model"], cpu_dense=False, use_process=None) -> "Model":
         if cpu_dense and use_process is not None and use_process < 1:
-            raise ValueError("use_process must be >= 1")
+            raise ValueError("use_process_num must be >= 1")
         self.handles.append(MapConcurrencyLayer(layer_or_model, is_cpu_dense=cpu_dense, use_process=use_process))
         return self
 
