@@ -299,8 +299,6 @@ class ConcurrencyLayer(Layer,ABC):
                 result, _context_bag = i
                 #合并上下文
                 await context_bag.merge(_context_bag, concurrency_merge=True)
-            #添加到数据列表
-            res_datas.append(result)
 
 
             # 重新包装包含特殊控制流信号的列表
